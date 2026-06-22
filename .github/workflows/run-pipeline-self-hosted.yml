@@ -1,0 +1,41 @@
+name: Run LRL Pipeline (Self-Hosted)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'logs/**'
+      - '**.md'
+      - 'LICENSE'
+
+jobs:
+  run-pipeline:
+    runs-on: self-hosted
+    timeout-minutes: 2880
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run pipeline
+        run: |
+          source ~/nllb-env/bin/activate
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          mkdir -p logs
+          python lrl_fr-pipeline.py 2>&1 | tee "logs/pipeline_${TIMESTAMP}.log"
+
+      - name: Commit and push logs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs/
+          git diff --staged --quiet || (
+            git commit -m "logs: pipeline run $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]" &&
+            git pull --rebase origin main &&
+            git push
+          )
