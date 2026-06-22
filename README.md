@@ -75,6 +75,16 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast \
 
 ### Back-translation with monolingual data
 
+To let the pipeline augment its own training split without an external file:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast --self-backtranslation
+```
+
+This uses each unique Ewe training target to generate an alternative French
+input. The most recent completed Ewe model under `outputs/runs` is selected as
+the generator; when none exists, the configured base model is used.
+
 Put one original low-resource-language sentence per line in a UTF-8 text file,
 for example `Dataset/ewe_monolingual.txt`. Then run:
 

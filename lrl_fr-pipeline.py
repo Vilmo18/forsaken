@@ -3,6 +3,7 @@ import pandas as pd
 import argparse
 import gc
 import math
+import random
 import torch
 
 from Cleaning import BilingualDataCleaner
@@ -37,6 +38,11 @@ parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
 parser.add_argument("--max-augmented-variants", type=int, default=3)
 parser.add_argument("--monolingual-data", default=None)
 parser.add_argument("--monolingual-column", default=None)
+parser.add_argument(
+    "--self-backtranslation",
+    action="store_true",
+    help="Generate synthetic French inputs from the Ewe targets already in the training split",
+)
 parser.add_argument("--backtranslation-model", default=None)
 parser.add_argument("--backtranslation-batch-size", type=int, default=16)
 parser.add_argument("--backtranslation-min-cycle-similarity", type=float, default=0.45)
@@ -186,6 +192,7 @@ for file_path in dataset_files:
     "max_augmented_variants": args.max_augmented_variants,
     "balance_directions": True,
     "monolingual_data": args.monolingual_data,
+    "self_backtranslation": args.self_backtranslation,
     "backtranslation_model": args.backtranslation_model,
     "cleaning_stats": cleaning_stats
     }
@@ -220,18 +227,51 @@ for file_path in dataset_files:
         cleaned_paths[f"val_french2{language_key}"]
     )
 
-    if args.monolingual_data:
-        monolingual_texts = load_monolingual_texts(
-            args.monolingual_data,
-            column=args.monolingual_column,
-            max_samples=args.max_synthetic_samples,
-            seed=42,
-        )
+    if args.monolingual_data or args.self_backtranslation:
+        if args.monolingual_data:
+            monolingual_texts = load_monolingual_texts(
+                args.monolingual_data,
+                column=args.monolingual_column,
+                max_samples=args.max_synthetic_samples,
+                seed=42,
+            )
+            backtranslation_source = "external_monolingual_data"
+        else:
+            training_frame = train_f2t.to_pandas()
+            monolingual_texts = []
+            seen_monolingual = set()
+            for value in training_frame[language].tolist():
+                if pd.isna(value):
+                    continue
+                text = " ".join(str(value).strip().split())
+                normalized = text.lower()
+                if text and normalized not in seen_monolingual:
+                    seen_monolingual.add(normalized)
+                    monolingual_texts.append(text)
+            random.Random(42).shuffle(monolingual_texts)
+            if args.max_synthetic_samples is not None:
+                monolingual_texts = monolingual_texts[:args.max_synthetic_samples]
+            backtranslation_source = "training_targets"
+
         if not monolingual_texts:
             raise ValueError("No usable monolingual sentences were found")
-        backtranslation_model = args.backtranslation_model or args.model_id
+
+        backtranslation_model = args.backtranslation_model
+        if backtranslation_model is None:
+            prior_models = sorted(
+                (
+                    path for path in Path("outputs/runs").glob(
+                        f"{language_key}_*/model-merged"
+                    )
+                    if (path / "config.json").exists()
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            backtranslation_model = str(prior_models[0]) if prior_models else args.model_id
+
         print(
-            f"Back-translating {len(monolingual_texts)} monolingual {language} sentences "
+            f"Back-translating {len(monolingual_texts)} {language} sentences "
             f"with {backtranslation_model}"
         )
         backtranslator = BackTranslator(
@@ -257,6 +297,8 @@ for file_path in dataset_files:
             synthetic_pairs,
         )
         run_config["backtranslation"] = {
+            "source": backtranslation_source,
+            "model": backtranslation_model,
             "monolingual_examples": len(monolingual_texts),
             "generated_pairs": len(synthetic_pairs),
             "unique_pairs_added": synthetic_added,
