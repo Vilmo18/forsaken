@@ -163,6 +163,7 @@ for file_path in dataset_files:
     "effective_batch_size": batch_size * gradient_accumulation_steps,
     "num_train_epochs": num_train_epochs,
     "max_length": max_length,
+    "balance_directions": True,
     "cleaning_stats": cleaning_stats
     })
 

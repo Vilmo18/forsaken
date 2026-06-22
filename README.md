@@ -56,7 +56,8 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast
 
 Replace `ewe` with `mina` or `kabye`. Fast mode defaults to a batch size of 16,
 8 epochs, BF16 when supported (otherwise FP16), a 128-token limit, and keeps the
-checkpoint with the best validation loss. The effective batch remains 16.
+checkpoint with the best validation loss. The effective batch remains 16, and
+the two translation directions are balanced to contribute equally to training.
 
 The main training settings can be overridden from the command line:
 

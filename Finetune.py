@@ -105,7 +105,15 @@ class BilingualFineTuner:
         
         self.model.print_trainable_parameters()
         
-    def tokenize_data(self, train_t2f, val_t2f, train_f2t, val_f2t, max_length=256):
+    def tokenize_data(
+        self,
+        train_t2f,
+        val_t2f,
+        train_f2t,
+        val_f2t,
+        max_length=256,
+        balance_directions=True,
+    ):
         """Tokenize the datasets for both translation directions"""
         
         def map_lang_to_french(batch):
@@ -137,6 +145,33 @@ class BilingualFineTuner:
         print(f"Tokenizing French->{self.language_name} data...")
         tok_train_f2t = train_f2t.map(map_french_to_lang, batched=True, remove_columns=train_f2t.column_names)
         tok_val_f2t   = val_f2t.map(map_french_to_lang, batched=True, remove_columns=val_f2t.column_names)
+
+        if balance_directions:
+            target_size = max(len(tok_train_t2f), len(tok_train_f2t))
+
+            def upsample(dataset, seed):
+                if len(dataset) == 0:
+                    raise ValueError("Cannot balance an empty translation dataset")
+                if len(dataset) == target_size:
+                    return dataset
+
+                indices = list(range(len(dataset)))
+                rng = random.Random(seed)
+                while len(indices) < target_size:
+                    extra = list(range(len(dataset)))
+                    rng.shuffle(extra)
+                    indices.extend(extra[:target_size - len(indices)])
+                return dataset.select(indices)
+
+            before_t2f = len(tok_train_t2f)
+            before_f2t = len(tok_train_f2t)
+            tok_train_t2f = upsample(tok_train_t2f, seed=42)
+            tok_train_f2t = upsample(tok_train_f2t, seed=43)
+            print(
+                "Balanced training directions: "
+                f"T2F {before_t2f}->{len(tok_train_t2f)}, "
+                f"F2T {before_f2t}->{len(tok_train_f2t)}"
+            )
 
         train_ds = concatenate_datasets([tok_train_t2f, tok_train_f2t]).shuffle(seed=42)
         eval_ds  = concatenate_datasets([tok_val_t2f, tok_val_f2t]).shuffle(seed=42)
