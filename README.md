@@ -5,7 +5,8 @@ A repository which contains the complete pipeline from data pre-processing to ev
 - Loads data from Excel files with multiple sheets
 - Cleans and preprocesses text data
 - Handles numbers, dates, and special characters in French
-- Creates augmented datasets through transliteration and diacritic removal
+- Creates bounded training-only augmentations through transliteration,
+  diacritic removal, typography normalization, and punctuation variants
 - Prepares train/validation splits for both translation directions
 - Outputs Hugging Face Dataset compatible JSONL files
 
@@ -54,21 +55,22 @@ To run the complete pipeline with the GPU-optimized training profile:
 python3 lrl_fr-pipeline.py --dataset ewe --fast
 ```
 
-Replace `ewe` with `mina` or `kabye`. The pipeline uses the NLLB 1.3B model.
-Fast mode defaults to a batch size of 8 with 2 gradient-accumulation steps,
-8 epochs, BF16 when supported (otherwise FP16), a 128-token limit, and keeps
-the checkpoint with the best validation loss. The effective batch remains 16,
-and the two translation directions are balanced to contribute equally.
+Replace `ewe` with `mina` or `kabye`. The pipeline uses the NLLB distilled 600M
+model. Fast mode defaults to a batch size of 16, 8 epochs, BF16 when supported
+(otherwise FP16), a 128-token limit, and keeps the checkpoint with the best
+validation loss. Augmentation is applied only to the training split, and the
+two translation directions are balanced to contribute equally.
 
 The main training settings can be overridden from the command line:
 
 ```bash
 python3 lrl_fr-pipeline.py --dataset ewe --fast \
-    --model-id facebook/nllb-200-1.3B \
-    --batch-size 8 \
-    --gradient-accumulation-steps 2 \
+    --model-id facebook/nllb-200-distilled-600M \
+    --batch-size 16 \
+    --gradient-accumulation-steps 1 \
     --epochs 8 \
-    --max-length 128
+    --max-length 128 \
+    --max-augmented-variants 3
 ```
 
 ## Model Evaluation

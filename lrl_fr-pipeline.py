@@ -31,9 +31,10 @@ parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
 parser.add_argument("--epochs", type=int, default=None)
 parser.add_argument("--max-length", type=int, default=None)
 parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+parser.add_argument("--max-augmented-variants", type=int, default=3)
 args = parser.parse_args()
 
-batch_size = args.batch_size or (8 if args.fast else 2)
+batch_size = args.batch_size or (16 if args.fast else 2)
 gradient_accumulation_steps = args.gradient_accumulation_steps
 if gradient_accumulation_steps is None:
     gradient_accumulation_steps = (
@@ -46,6 +47,8 @@ max_length = args.max_length or (128 if args.fast else 256)
 
 if min(batch_size, gradient_accumulation_steps, num_train_epochs, max_length) < 1:
     parser.error("batch size, accumulation steps, epochs, and max length must be positive")
+if args.max_augmented_variants < 0:
+    parser.error("max augmented variants must be non-negative")
 
 dataset_files = Path(DATASET_DIR).glob("*.xlsx")
 
@@ -142,7 +145,8 @@ for file_path in dataset_files:
         target_col=target_col,
         test_size=0.2,
         seed=42,
-        enable_paraphrasing=False
+        enable_paraphrasing=False,
+        max_augmented_variants=args.max_augmented_variants,
     )
 
     datasets = cleaning_result["datasets"]
@@ -164,6 +168,7 @@ for file_path in dataset_files:
     "effective_batch_size": batch_size * gradient_accumulation_steps,
     "num_train_epochs": num_train_epochs,
     "max_length": max_length,
+    "max_augmented_variants": args.max_augmented_variants,
     "balance_directions": True,
     "cleaning_stats": cleaning_stats
     })

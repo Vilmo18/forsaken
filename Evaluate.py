@@ -5,7 +5,7 @@ from peft import PeftModel
 import evaluate
 from tqdm import tqdm
 
-DEFAULT_MODEL_ID = "facebook/nllb-200-1.3B"
+DEFAULT_MODEL_ID = "facebook/nllb-200-distilled-600M"
 
 class BilingualEvaluator:
     def __init__(

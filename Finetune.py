@@ -11,7 +11,7 @@ from peft import LoraConfig, get_peft_model, TaskType
 from pathlib import Path
 import argparse
 
-DEFAULT_MODEL_ID = "facebook/nllb-200-1.3B"
+DEFAULT_MODEL_ID = "facebook/nllb-200-distilled-600M"
 
 def set_seed(seed=42):
     """Set random seeds for reproducibility"""

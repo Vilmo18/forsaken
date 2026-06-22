@@ -160,6 +160,37 @@ class BilingualDataCleaner:
         return unicodedata.normalize('NFC', text)
 
     @staticmethod
+    def normalize_typography(text: str) -> str:
+        """Normalize punctuation without changing sentence meaning."""
+        if not isinstance(text, str):
+            return text
+        translations = str.maketrans({
+            '’': "'",
+            '‘': "'",
+            '“': '"',
+            '”': '"',
+            '–': '-',
+            '—': '-',
+            '…': '...',
+        })
+        text = text.translate(translations)
+        text = re.sub(r'\s+([,.;:!?])', r'\1', text)
+        return " ".join(text.split())
+
+    @staticmethod
+    def strip_terminal_punctuation(text: str) -> str:
+        """Create a punctuation-light input variant for noisy user text."""
+        if not isinstance(text, str):
+            return text
+        return re.sub(r'[\s.!?;:…]+$', '', text).strip()
+
+    def normalize_noisy_input(self, text: str) -> str:
+        """Combine typography and diacritic normalization in one variant."""
+        text = self.normalize_typography(text)
+        text = self.remove_diacritics(text)
+        return self.strip_terminal_punctuation(text)
+
+    @staticmethod
     def normalize_text(text) -> str:
         """Normalize only if text is a string; otherwise return as-is for deduplication."""
         if isinstance(text, str):
@@ -262,33 +293,51 @@ class BilingualDataCleaner:
 
         return pd.DataFrame(augmented_pairs, columns=[self.source_col, self.target_col])
 
-    def create_augmentations(self, data, input_column):
+    def create_augmentations(self, data, input_column, max_augmented_variants=3):
         """
-        Apply augmentations ONLY to the input column.
+        Apply bounded, meaning-preserving augmentations ONLY to the input column.
         """
-        augmented_dfs = [data.assign(is_aug=0)]  # Original
+        if max_augmented_variants < 0:
+            raise ValueError("max_augmented_variants must be non-negative")
 
-        # Transliteration
-        aug_data_1 = data.copy()
-        aug_data_1[input_column] = aug_data_1[input_column].map(self.transliterate_text)
+        base = data.reset_index(drop=True).copy()
+        base['_augmentation_source_id'] = range(len(base))
+        augmented_dfs = [base.assign(is_aug='original')]
 
-        mask_1 = ~aug_data_1[input_column].fillna('').eq(data[input_column].fillna(''))
-        if mask_1.any():
-          augmented_dfs.append(aug_data_1.loc[mask_1].assign(is_aug=1))
+        transformations = [
+            ('transliterated', self.transliterate_text),
+            ('no_diacritics', self.remove_diacritics),
+            ('normalized_typography', self.normalize_typography),
+            ('no_terminal_punctuation', self.strip_terminal_punctuation),
+            ('normalized_noisy_input', self.normalize_noisy_input),
+        ]
 
-        # Diacritic removal
-        aug_data_2 = data.copy()
-        aug_data_2[input_column] = aug_data_2[input_column].map(self.remove_diacritics)
-
-        mask_2 = ~aug_data_2[input_column].fillna('').eq(data[input_column].fillna(''))
-        if mask_2.any():
-          augmented_dfs.append(aug_data_2.loc[mask_2].assign(is_aug=2))
+        for name, transform in transformations:
+            augmented_data = base.copy()
+            augmented_data[input_column] = augmented_data[input_column].map(transform)
+            changed = ~augmented_data[input_column].fillna('').eq(base[input_column].fillna(''))
+            if changed.any():
+                augmented_dfs.append(augmented_data.loc[changed].assign(is_aug=name))
 
         augmented = pd.concat(augmented_dfs, ignore_index=True)
         augmented = augmented.drop_duplicates(subset=[self.source_col, self.target_col])
-        return augmented  
+        augmented = (
+            augmented
+            .groupby('_augmentation_source_id', sort=False, group_keys=False)
+            .head(max_augmented_variants + 1)
+            .drop(columns=['_augmentation_source_id'])
+            .reset_index(drop=True)
+        )
+        return augmented
 
-    def prepare_datasets(self, data, test_size=0.2, seed=42, enable_paraphrasing=False):
+    def prepare_datasets(
+        self,
+        data,
+        test_size=0.2,
+        seed=42,
+        enable_paraphrasing=False,
+        max_augmented_variants=3,
+    ):
         """
         Prepare train/validation datasets for both translation directions
         """
@@ -300,13 +349,6 @@ class BilingualDataCleaner:
                 .astype(str)
                 .str.strip()
             )
-        # Generate paraphrases if enabled
-        if enable_paraphrasing:
-            print("\nGenerating paraphrases for augmentation...")
-            data = self.generate_paraphrases(data)
-            data.to_excel('augmented_df.xlsx', index=False)
-            print(f"Augmented data saved to augmented_df.xlsx ({len(data)} examples)")
-
         # Build one clean bilingual table and split it before augmentation. This
         # keeps validation examples (and their augmented variants) out of train.
         source_target = data[[self.source_col, self.target_col]].dropna().copy()
@@ -325,16 +367,36 @@ class BilingualDataCleaner:
         train_original = split['train'].to_pandas()
         val_source_target = split['test'].to_pandas()
 
-        train_source_target = self.create_augmentations(
+        # Optional paraphrases are generated only after the split so synthetic
+        # versions of validation examples can never leak into training.
+        if enable_paraphrasing:
+            print("\nGenerating training-only paraphrases...")
+            train_original = self.generate_paraphrases(train_original)
+            train_original.to_excel('augmented_train_df.xlsx', index=False)
+            print(f"Augmented training data saved ({len(train_original)} examples)")
+
+        train_source_target_augmented = self.create_augmentations(
             train_original,
             input_column=self.source_col,
-        ).drop(columns=['is_aug'])
+            max_augmented_variants=max_augmented_variants,
+        )
+        source_augmentation_counts = {
+            str(name): int(count)
+            for name, count in train_source_target_augmented['is_aug'].value_counts().items()
+        }
+        train_source_target = train_source_target_augmented.drop(columns=['is_aug'])
 
         train_target_source_original = train_original[[self.target_col, self.source_col]].copy()
-        train_target_source = self.create_augmentations(
+        train_target_source_augmented = self.create_augmentations(
             train_target_source_original,
             input_column=self.target_col,
-        ).drop(columns=['is_aug'])
+            max_augmented_variants=max_augmented_variants,
+        )
+        target_augmentation_counts = {
+            str(name): int(count)
+            for name, count in train_target_source_augmented['is_aug'].value_counts().items()
+        }
+        train_target_source = train_target_source_augmented.drop(columns=['is_aug'])
         val_target_source = val_source_target[[self.target_col, self.source_col]].copy()
 
         augmented_source_target_size = len(train_source_target)
@@ -367,6 +429,7 @@ class BilingualDataCleaner:
                 "train_examples_before_augmentation": len(train_original),
                 "augmented_examples": augmented_source_target_size,
                 "augmentation_gain": augmented_source_target_size - len(train_original),
+                "augmentation_types": source_augmentation_counts,
                 "validation_examples": len(val_source_target),
             },
             "target_to_source": {
@@ -374,6 +437,7 @@ class BilingualDataCleaner:
                 "train_examples_before_augmentation": len(train_target_source_original),
                 "augmented_examples": augmented_target_source_size,
                 "augmentation_gain": augmented_target_source_size - len(train_target_source_original),
+                "augmentation_types": target_augmentation_counts,
                 "validation_examples": len(val_target_source),
             }
         }
@@ -441,6 +505,12 @@ def main():
     parser.add_argument('--target_col', type=str, default=None, help='Target column name (auto-detected if not provided)')
     parser.add_argument('--test_size', type=float, default=0.2, help='Validation split ratio (default: 0.2)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
+    parser.add_argument(
+        '--max_augmented_variants',
+        type=int,
+        default=3,
+        help='Maximum synthetic input variants per original training pair',
+    )
 
     # Paraphrasing arguments
     parser.add_argument('--enable_paraphrasing', action='store_true', help='Enable paraphrasing augmentation')
@@ -474,15 +544,17 @@ def main():
     cleaner = BilingualDataCleaner(args.language, azure_config=azure_config)
 
     print(f"\nProcessing: {args.data_path}")
-    datasets = cleaner.process_dataset(
+    result = cleaner.process_dataset(
         file_path=args.data_path,
         sheets=args.sheets,
         source_col=args.source_col,
         target_col=args.target_col,
         test_size=args.test_size,
         seed=args.seed,
-        enable_paraphrasing=args.enable_paraphrasing
+        enable_paraphrasing=args.enable_paraphrasing,
+        max_augmented_variants=args.max_augmented_variants,
     )
+    datasets = result['datasets']
 
     # Save datasets
     print(f"\nSaving datasets to: {args.output_dir}")
