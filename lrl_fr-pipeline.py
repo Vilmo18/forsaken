@@ -1,6 +1,7 @@
 from pathlib import Path
 import pandas as pd
 import argparse
+import math
 
 from Cleaning import BilingualDataCleaner
 from Finetune import BilingualFineTuner, set_seed
@@ -20,7 +21,30 @@ LANGUAGE_CODES = {
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default=None)
+parser.add_argument(
+    "--fast",
+    action="store_true",
+    help="Use the GPU-optimized profile with larger batches and quality safeguards",
+)
+parser.add_argument("--batch-size", type=int, default=None)
+parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+parser.add_argument("--epochs", type=int, default=None)
+parser.add_argument("--max-length", type=int, default=None)
 args = parser.parse_args()
+
+batch_size = args.batch_size or (16 if args.fast else 2)
+gradient_accumulation_steps = args.gradient_accumulation_steps
+if gradient_accumulation_steps is None:
+    gradient_accumulation_steps = (
+        max(1, math.ceil(16 / batch_size))
+        if args.fast or args.batch_size is not None
+        else 8
+    )
+num_train_epochs = args.epochs or 8
+max_length = args.max_length or (128 if args.fast else 256)
+
+if min(batch_size, gradient_accumulation_steps, num_train_epochs, max_length) < 1:
+    parser.error("batch size, accumulation steps, epochs, and max length must be positive")
 
 dataset_files = Path(DATASET_DIR).glob("*.xlsx")
 
@@ -133,6 +157,12 @@ for file_path in dataset_files:
     "test_size": 0.2,
     "seed": 42,
     "base_model": "facebook/nllb-200-distilled-600M",
+    "fast_mode": args.fast,
+    "batch_size": batch_size,
+    "gradient_accumulation_steps": gradient_accumulation_steps,
+    "effective_batch_size": batch_size * gradient_accumulation_steps,
+    "num_train_epochs": num_train_epochs,
+    "max_length": max_length,
     "cleaning_stats": cleaning_stats
     })
 
@@ -172,16 +202,43 @@ for file_path in dataset_files:
         train_t2f,
         val_t2f,
         train_f2t,
-        val_f2t
+        val_f2t,
+        max_length=max_length,
     )
 
     model_output = tracker.model_dir
     merged_output = tracker.merged_dir
 
+    training_args = {
+        "per_device_train_batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "num_train_epochs": num_train_epochs,
+    }
+
+    if args.fast:
+        training_args.update({
+            "per_device_eval_batch_size": batch_size * 2,
+            "learning_rate": 1e-4,
+            "weight_decay": 0.01,
+            "label_smoothing_factor": 0.1,
+            "save_strategy": "epoch",
+            "eval_strategy": "epoch",
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_loss",
+            "greater_is_better": False,
+            "save_total_limit": 2,
+            "logging_steps": 50,
+            "warmup_steps": 0,
+            "warmup_ratio": 0.05,
+            "group_by_length": True,
+            "dataloader_num_workers": 4,
+        })
+
     finetuner.train(
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        output_dir=str(model_output)
+        output_dir=str(model_output),
+        **training_args,
     )
 
     finetuner.save_models(adapter_dir=str(tracker.model_dir / "adapter"), 

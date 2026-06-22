@@ -48,6 +48,26 @@ python Finetune.py \
     --val_f2t path/to/val_fr2lang.jsonl
 ```
 
+To run the complete pipeline with the GPU-optimized training profile:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast
+```
+
+Replace `ewe` with `mina` or `kabye`. Fast mode defaults to a batch size of 16,
+8 epochs, BF16 when supported (otherwise FP16), a 128-token limit, and keeps the
+checkpoint with the best validation loss. The effective batch remains 16.
+
+The main training settings can be overridden from the command line:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --batch-size 16 \
+    --gradient-accumulation-steps 1 \
+    --epochs 8 \
+    --max-length 128
+```
+
 ## Model Evaluation
 
 Evaluate your trained bilingual translation models using BLEU and METEOR metrics.

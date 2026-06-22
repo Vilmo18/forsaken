@@ -35,6 +35,8 @@ class BilingualFineTuner:
         self.tokenizer = None
         self.model = None
         self.tracker=tracker
+        self.use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        self.compute_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
         
     def load_data(self, train_t2f_path, val_t2f_path, train_f2t_path, val_f2t_path):
         """Load the cleaned JSONL datasets"""
@@ -67,7 +69,8 @@ class BilingualFineTuner:
         
         # Add language token if it doesn't exist
         lang_token = self.language_code
-        if lang_token not in self.tokenizer.get_vocab():
+        token_added = lang_token not in self.tokenizer.get_vocab()
+        if token_added:
             self.tokenizer.add_tokens([lang_token], special_tokens=True)
             print(f"Added new token: {lang_token}")
         else:
@@ -76,11 +79,12 @@ class BilingualFineTuner:
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
             self.model_id, 
             device_map={"": 0},
-            dtype=torch.float16
+            torch_dtype=self.compute_dtype
         )
+        print(f"Training precision: {self.compute_dtype}")
 
         # Resize embeddings if new token was added
-        if lang_token not in self.tokenizer.get_vocab():
+        if token_added:
             self.model.resize_token_embeddings(len(self.tokenizer))
             print(f"Resized embeddings to {len(self.tokenizer)} tokens")
             
@@ -144,7 +148,12 @@ class BilingualFineTuner:
     def train(self, train_dataset, eval_dataset, output_dir, **training_args):
         """Run the training process"""
         
-        collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model, padding=True)
+        collator = DataCollatorForSeq2Seq(
+            self.tokenizer,
+            model=self.model,
+            padding=True,
+            pad_to_multiple_of=8,
+        )
         
         default_args = {
             "output_dir": output_dir,
@@ -152,7 +161,8 @@ class BilingualFineTuner:
             "gradient_accumulation_steps": 8,
             "learning_rate": 3e-5,
             "num_train_epochs": 8,
-            "fp16": False,
+            "bf16": self.use_bf16,
+            "fp16": torch.cuda.is_available() and not self.use_bf16,
             "logging_steps": 50,
             "save_strategy": "epoch",
             "eval_strategy": "epoch",

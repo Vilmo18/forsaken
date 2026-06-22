@@ -59,6 +59,7 @@ class BilingualEvaluator:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
+                    forced_bos_token_id=self.tokenizer.convert_tokens_to_ids("fra_Latn"),
                     max_new_tokens=96,
                     num_beams=4,
                     no_repeat_ngram_size=3,
@@ -96,6 +97,7 @@ class BilingualEvaluator:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
+                    forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(self.language_code),
                     max_new_tokens=96,
                     num_beams=4,
                     no_repeat_ngram_size=3,

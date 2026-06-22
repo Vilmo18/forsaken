@@ -307,49 +307,56 @@ class BilingualDataCleaner:
             data.to_excel('augmented_df.xlsx', index=False)
             print(f"Augmented data saved to augmented_df.xlsx ({len(data)} examples)")
 
-        # Source → Target (e.g., Kabye → French)
+        # Build one clean bilingual table and split it before augmentation. This
+        # keeps validation examples (and their augmented variants) out of train.
         source_target = data[[self.source_col, self.target_col]].dropna().copy()
-
-        # Apply French cleaning and normalization
         source_target[self.target_col] = source_target[self.target_col].apply(self.clean_french)
         source_target[self.target_col] = source_target[self.target_col].apply(self.french_normalize)
+        source_target = source_target[
+            source_target[self.source_col].ne('') & source_target[self.target_col].ne('')
+        ].drop_duplicates(subset=[self.source_col, self.target_col]).reset_index(drop=True)
 
-        source_target_augmented = self.create_augmentations(source_target, input_column=self.source_col)
-        source_target_original = source_target.copy()
-        original_source_target_size = len(source_target_original)
-        augmented_source_target_size = len(source_target_augmented)
-
-        # Target → Source (e.g., French → Kabye)
-        target_source = data[[self.target_col, self.source_col]].dropna().copy()
-
-        # Apply French cleaning and normalization
-        target_source[self.target_col] = target_source[self.target_col].apply(self.clean_french)
-        target_source[self.target_col] = target_source[self.target_col].apply(self.french_normalize)
-
-        target_source_augmented = self.create_augmentations(target_source, input_column=self.target_col)
-        target_source_original = target_source.copy()
-        original_target_source_size = len(target_source_original)
-        augmented_target_source_size = len(target_source_augmented)
-
-        # Convert to HuggingFace datasets
-        st_full_ds = Dataset.from_pandas(
-            source_target_augmented.drop(columns=['is_aug']).astype('string'),
-            preserve_index=False
+        original_source_target_size = len(source_target)
+        original_dataset = Dataset.from_pandas(
+            source_target.astype('string'),
+            preserve_index=False,
         )
-        st_orig_ds = Dataset.from_pandas(source_target_original.astype('string'), preserve_index=False)
+        split = original_dataset.train_test_split(test_size=test_size, seed=seed)
+        train_original = split['train'].to_pandas()
+        val_source_target = split['test'].to_pandas()
 
-        ts_full_ds = Dataset.from_pandas(
-            target_source_augmented.drop(columns=['is_aug']).astype('string'),
-            preserve_index=False
+        train_source_target = self.create_augmentations(
+            train_original,
+            input_column=self.source_col,
+        ).drop(columns=['is_aug'])
+
+        train_target_source_original = train_original[[self.target_col, self.source_col]].copy()
+        train_target_source = self.create_augmentations(
+            train_target_source_original,
+            input_column=self.target_col,
+        ).drop(columns=['is_aug'])
+        val_target_source = val_source_target[[self.target_col, self.source_col]].copy()
+
+        augmented_source_target_size = len(train_source_target)
+        original_target_source_size = original_source_target_size
+        augmented_target_source_size = len(train_target_source)
+
+        train_st = Dataset.from_pandas(
+            train_source_target.astype('string'),
+            preserve_index=False,
         )
-        ts_orig_ds = Dataset.from_pandas(target_source_original.astype('string'), preserve_index=False)
-
-        # Split datasets
-        train_st = st_full_ds
-        _, val_st = st_orig_ds.train_test_split(test_size=test_size, seed=seed).values()
-
-        train_ts = ts_full_ds
-        _, val_ts = ts_orig_ds.train_test_split(test_size=test_size, seed=seed).values()
+        val_st = Dataset.from_pandas(
+            val_source_target.astype('string'),
+            preserve_index=False,
+        )
+        train_ts = Dataset.from_pandas(
+            train_target_source.astype('string'),
+            preserve_index=False,
+        )
+        val_ts = Dataset.from_pandas(
+            val_target_source.astype('string'),
+            preserve_index=False,
+        )
 
         lang_lower = self.language_name.lower()
         target_lower = self.target_col.lower()
@@ -357,13 +364,17 @@ class BilingualDataCleaner:
         stats = {
             "source_to_target": {
                 "original_examples": original_source_target_size,
+                "train_examples_before_augmentation": len(train_original),
                 "augmented_examples": augmented_source_target_size,
-                "augmentation_gain": augmented_source_target_size - original_source_target_size
+                "augmentation_gain": augmented_source_target_size - len(train_original),
+                "validation_examples": len(val_source_target),
             },
             "target_to_source": {
                 "original_examples": original_target_source_size,
+                "train_examples_before_augmentation": len(train_target_source_original),
                 "augmented_examples": augmented_target_source_size,
-                "augmentation_gain": augmented_target_source_size - original_target_source_size
+                "augmentation_gain": augmented_target_source_size - len(train_target_source_original),
+                "validation_examples": len(val_target_source),
             }
         }
 
