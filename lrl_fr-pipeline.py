@@ -220,7 +220,6 @@ for file_path in dataset_files:
             "per_device_eval_batch_size": batch_size * 2,
             "learning_rate": 1e-4,
             "weight_decay": 0.01,
-            "label_smoothing_factor": 0.1,
             "save_strategy": "epoch",
             "eval_strategy": "epoch",
             "load_best_model_at_end": True,

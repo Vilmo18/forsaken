@@ -78,6 +78,7 @@ class BilingualFineTuner:
 
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
             self.model_id,
+            device_map={"": 0},
             torch_dtype=self.compute_dtype
         )
         print(f"Training precision: {self.compute_dtype}")
@@ -147,16 +148,9 @@ class BilingualFineTuner:
     def train(self, train_dataset, eval_dataset, output_dir, **training_args):
         """Run the training process"""
         
-        # Give the collator the underlying seq2seq model so it always creates
-        # decoder_input_ids before Trainer removes labels for label smoothing.
-        collator_model = (
-            self.model.get_base_model()
-            if hasattr(self.model, "get_base_model")
-            else self.model
-        )
         collator = DataCollatorForSeq2Seq(
             self.tokenizer,
-            model=collator_model,
+            model=self.model,
             padding=True,
             pad_to_multiple_of=8,
         )
