@@ -62,6 +62,34 @@ class BilingualFineTuner:
         val_f2t   = Dataset.from_pandas(val_f2t, preserve_index=False)
         
         return train_t2f, val_t2f, train_f2t, val_f2t
+
+    def add_synthetic_french_to_language(self, train_f2t, synthetic_pairs):
+        """Append unique back-translated French->language pairs to training."""
+        if synthetic_pairs is None or synthetic_pairs.empty:
+            return train_f2t, 0
+
+        required_columns = ["French", self.language_name]
+        missing = [column for column in required_columns if column not in synthetic_pairs.columns]
+        if missing:
+            raise ValueError(f"Synthetic data is missing columns: {missing}")
+
+        existing = train_f2t.to_pandas()[required_columns].copy()
+        synthetic = synthetic_pairs[required_columns].copy()
+        normalize = lambda value: " ".join(str(value).strip().lower().split())
+        existing_keys = {
+            (normalize(row["French"]), normalize(row[self.language_name]))
+            for _, row in existing.iterrows()
+        }
+        keep = [
+            (normalize(row["French"]), normalize(row[self.language_name])) not in existing_keys
+            for _, row in synthetic.iterrows()
+        ]
+        synthetic = synthetic.loc[keep].drop_duplicates(required_columns).reset_index(drop=True)
+        if synthetic.empty:
+            return train_f2t, 0
+
+        combined = pd.concat([existing, synthetic], ignore_index=True)
+        return Dataset.from_pandas(combined, preserve_index=False), len(synthetic)
     
     def setup_model_and_tokenizer(self):
         """Initialize the model and tokenizer"""

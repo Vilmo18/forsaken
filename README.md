@@ -73,6 +73,27 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast \
     --max-augmented-variants 3
 ```
 
+### Back-translation with monolingual data
+
+Put one original low-resource-language sentence per line in a UTF-8 text file,
+for example `Dataset/ewe_monolingual.txt`. Then run:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --monolingual-data Dataset/ewe_monolingual.txt \
+    --backtranslation-model outputs/runs/PRIOR_EWE_RUN/model-merged \
+    --backtranslation-batch-size 16 \
+    --backtranslation-min-cycle-similarity 0.45 \
+    --max-synthetic-samples 5000
+```
+
+The back-translation model generates synthetic French sources while the
+original Ewe sentences remain the trusted targets. Empty, copied,
+length-mismatched, cycle-inconsistent, and duplicate pairs are filtered before
+fine-tuning. If `--backtranslation-model` is omitted, the configured base model
+is used. Set the cycle-similarity threshold to `0` to disable round-trip
+filtering.
+
 ## Model Evaluation
 
 Evaluate your trained bilingual translation models using BLEU and METEOR metrics.

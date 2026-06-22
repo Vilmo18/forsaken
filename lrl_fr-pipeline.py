@@ -1,12 +1,15 @@
 from pathlib import Path
 import pandas as pd
 import argparse
+import gc
 import math
+import torch
 
 from Cleaning import BilingualDataCleaner
 from Finetune import BilingualFineTuner, DEFAULT_MODEL_ID, set_seed
 from Evaluate import BilingualEvaluator
 from Tracking import ExperimentTracker
+from Backtranslation import BackTranslator, load_monolingual_texts
 
 
 DATASET_DIR = "Dataset"
@@ -32,6 +35,12 @@ parser.add_argument("--epochs", type=int, default=None)
 parser.add_argument("--max-length", type=int, default=None)
 parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
 parser.add_argument("--max-augmented-variants", type=int, default=3)
+parser.add_argument("--monolingual-data", default=None)
+parser.add_argument("--monolingual-column", default=None)
+parser.add_argument("--backtranslation-model", default=None)
+parser.add_argument("--backtranslation-batch-size", type=int, default=16)
+parser.add_argument("--backtranslation-min-cycle-similarity", type=float, default=0.45)
+parser.add_argument("--max-synthetic-samples", type=int, default=None)
 args = parser.parse_args()
 
 batch_size = args.batch_size or (16 if args.fast else 2)
@@ -49,6 +58,12 @@ if min(batch_size, gradient_accumulation_steps, num_train_epochs, max_length) < 
     parser.error("batch size, accumulation steps, epochs, and max length must be positive")
 if args.max_augmented_variants < 0:
     parser.error("max augmented variants must be non-negative")
+if args.backtranslation_batch_size < 1:
+    parser.error("backtranslation batch size must be positive")
+if args.max_synthetic_samples is not None and args.max_synthetic_samples < 1:
+    parser.error("max synthetic samples must be positive")
+if not 0 <= args.backtranslation_min_cycle_similarity <= 1:
+    parser.error("backtranslation cycle similarity must be between 0 and 1")
 
 dataset_files = Path(DATASET_DIR).glob("*.xlsx")
 
@@ -154,7 +169,7 @@ for file_path in dataset_files:
 
     tracker.log_cleaning_stats(cleaning_stats)
 
-    tracker.log_config({
+    run_config = {
     "language": language,
     "language_code": language_code,
     "source_column": source_col,
@@ -170,8 +185,11 @@ for file_path in dataset_files:
     "max_length": max_length,
     "max_augmented_variants": args.max_augmented_variants,
     "balance_directions": True,
+    "monolingual_data": args.monolingual_data,
+    "backtranslation_model": args.backtranslation_model,
     "cleaning_stats": cleaning_stats
-    })
+    }
+    tracker.log_config(run_config)
 
     cleaned_paths = {}
 
@@ -201,6 +219,57 @@ for file_path in dataset_files:
         cleaned_paths[f"train_french2{language_key}"],
         cleaned_paths[f"val_french2{language_key}"]
     )
+
+    if args.monolingual_data:
+        monolingual_texts = load_monolingual_texts(
+            args.monolingual_data,
+            column=args.monolingual_column,
+            max_samples=args.max_synthetic_samples,
+            seed=42,
+        )
+        if not monolingual_texts:
+            raise ValueError("No usable monolingual sentences were found")
+        backtranslation_model = args.backtranslation_model or args.model_id
+        print(
+            f"Back-translating {len(monolingual_texts)} monolingual {language} sentences "
+            f"with {backtranslation_model}"
+        )
+        backtranslator = BackTranslator(
+            model_path=backtranslation_model,
+            language_name=language,
+            language_code=language_code,
+        )
+        synthetic_pairs = backtranslator.generate(
+            monolingual_texts,
+            batch_size=args.backtranslation_batch_size,
+            max_length=max_length,
+            min_cycle_similarity=args.backtranslation_min_cycle_similarity,
+        )
+        synthetic_path = tracker.data_dir / f"synthetic_french2{language_key}.jsonl"
+        synthetic_pairs.to_json(
+            synthetic_path,
+            orient="records",
+            lines=True,
+            force_ascii=False,
+        )
+        train_f2t, synthetic_added = finetuner.add_synthetic_french_to_language(
+            train_f2t,
+            synthetic_pairs,
+        )
+        run_config["backtranslation"] = {
+            "monolingual_examples": len(monolingual_texts),
+            "generated_pairs": len(synthetic_pairs),
+            "unique_pairs_added": synthetic_added,
+            "min_cycle_similarity": args.backtranslation_min_cycle_similarity,
+            "synthetic_dataset": str(synthetic_path),
+        }
+        tracker.log_config(run_config)
+        print(f"Added {synthetic_added} unique synthetic French->{language} pairs")
+
+        del backtranslator
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     finetuner.setup_model_and_tokenizer()
 
