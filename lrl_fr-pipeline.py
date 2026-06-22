@@ -4,7 +4,7 @@ import argparse
 import math
 
 from Cleaning import BilingualDataCleaner
-from Finetune import BilingualFineTuner, set_seed
+from Finetune import BilingualFineTuner, DEFAULT_MODEL_ID, set_seed
 from Evaluate import BilingualEvaluator
 from Tracking import ExperimentTracker
 
@@ -30,9 +30,10 @@ parser.add_argument("--batch-size", type=int, default=None)
 parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
 parser.add_argument("--epochs", type=int, default=None)
 parser.add_argument("--max-length", type=int, default=None)
+parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
 args = parser.parse_args()
 
-batch_size = args.batch_size or (16 if args.fast else 2)
+batch_size = args.batch_size or (8 if args.fast else 2)
 gradient_accumulation_steps = args.gradient_accumulation_steps
 if gradient_accumulation_steps is None:
     gradient_accumulation_steps = (
@@ -156,7 +157,7 @@ for file_path in dataset_files:
     "target_column": target_col,
     "test_size": 0.2,
     "seed": 42,
-    "base_model": "facebook/nllb-200-distilled-600M",
+    "base_model": args.model_id,
     "fast_mode": args.fast,
     "batch_size": batch_size,
     "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -185,6 +186,7 @@ for file_path in dataset_files:
     finetuner = BilingualFineTuner(
         language_name=language,
         language_code=language_code,
+        model_id=args.model_id,
         tracker=tracker
     )
 
@@ -253,7 +255,8 @@ for file_path in dataset_files:
         language_name=language,
         language_code=language_code,
         model_path=merged_model_path,
-        model_type="merged"
+        model_type="merged",
+        base_model_id=args.model_id,
     )
 
     evaluator.load_model()

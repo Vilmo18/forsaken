@@ -54,17 +54,19 @@ To run the complete pipeline with the GPU-optimized training profile:
 python3 lrl_fr-pipeline.py --dataset ewe --fast
 ```
 
-Replace `ewe` with `mina` or `kabye`. Fast mode defaults to a batch size of 16,
-8 epochs, BF16 when supported (otherwise FP16), a 128-token limit, and keeps the
-checkpoint with the best validation loss. The effective batch remains 16, and
-the two translation directions are balanced to contribute equally to training.
+Replace `ewe` with `mina` or `kabye`. The pipeline uses the NLLB 1.3B model.
+Fast mode defaults to a batch size of 8 with 2 gradient-accumulation steps,
+8 epochs, BF16 when supported (otherwise FP16), a 128-token limit, and keeps
+the checkpoint with the best validation loss. The effective batch remains 16,
+and the two translation directions are balanced to contribute equally.
 
 The main training settings can be overridden from the command line:
 
 ```bash
 python3 lrl_fr-pipeline.py --dataset ewe --fast \
-    --batch-size 16 \
-    --gradient-accumulation-steps 1 \
+    --model-id facebook/nllb-200-1.3B \
+    --batch-size 8 \
+    --gradient-accumulation-steps 2 \
     --epochs 8 \
     --max-length 128
 ```

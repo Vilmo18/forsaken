@@ -5,8 +5,17 @@ from peft import PeftModel
 import evaluate
 from tqdm import tqdm
 
+DEFAULT_MODEL_ID = "facebook/nllb-200-1.3B"
+
 class BilingualEvaluator:
-    def __init__(self, language_name, language_code, model_path, model_type="merged"):
+    def __init__(
+        self,
+        language_name,
+        language_code,
+        model_path,
+        model_type="merged",
+        base_model_id=DEFAULT_MODEL_ID,
+    ):
         """
         Initialize evaluator for a specific language
         
@@ -20,6 +29,7 @@ class BilingualEvaluator:
         self.language_code = language_code
         self.model_path = model_path
         self.model_type = model_type
+        self.base_model_id = base_model_id
         self.model = None
         self.tokenizer = None
         
@@ -29,7 +39,7 @@ class BilingualEvaluator:
         
         if self.model_type == "lora":
             base_model = AutoModelForSeq2SeqLM.from_pretrained(
-                "facebook/nllb-200-distilled-600M", 
+                self.base_model_id,
                 device_map="auto",
                 torch_dtype=torch.float16
             )
@@ -196,12 +206,19 @@ def main():
     parser.add_argument("--code", required=True, help="NLLB language code (e.g., ewe_Latn, tem_Latn)")
     parser.add_argument("--model_path", required=True, help="Path to trained model")
     parser.add_argument("--model_type", default="merged", choices=["merged", "lora"], help="Model type")
+    parser.add_argument("--base_model_id", default=DEFAULT_MODEL_ID, help="Base model used by a LoRA adapter")
     parser.add_argument("--val_lang2fr", required=True, help="Path to validation Lang->French JSONL")
     parser.add_argument("--val_fr2lang", required=True, help="Path to validation French->Lang JSONL")
     
     args = parser.parse_args()
     
-    evaluator = BilingualEvaluator(args.language, args.code, args.model_path, args.model_type)
+    evaluator = BilingualEvaluator(
+        args.language,
+        args.code,
+        args.model_path,
+        args.model_type,
+        args.base_model_id,
+    )
     
     evaluator.load_model()
     

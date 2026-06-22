@@ -11,6 +11,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 from pathlib import Path
 import argparse
 
+DEFAULT_MODEL_ID = "facebook/nllb-200-1.3B"
+
 def set_seed(seed=42):
     """Set random seeds for reproducibility"""
     random.seed(seed)
@@ -20,7 +22,7 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
 
 class BilingualFineTuner:
-    def __init__(self, language_name, language_code, model_id="facebook/nllb-200-distilled-600M", tracker=None):
+    def __init__(self, language_name, language_code, model_id=DEFAULT_MODEL_ID, tracker=None):
         """
         Initialize the fine-tuner for a specific language
         
@@ -264,7 +266,7 @@ def main():
     parser.add_argument("--train_f2t", required=True, help="Path to train French->Lang JSONL")
     parser.add_argument("--val_f2t", required=True, help="Path to val French->Lang JSONL")
     parser.add_argument("--output_dir", default="nllb-bidirectional", help="Output directory for models")
-    parser.add_argument("--model_id", default="facebook/nllb-200-distilled-600M", help="Base model ID")
+    parser.add_argument("--model_id", default=DEFAULT_MODEL_ID, help="Base model ID")
     
     args = parser.parse_args()
     
