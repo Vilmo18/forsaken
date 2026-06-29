@@ -101,6 +101,40 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast \
     --french-to-language-weight 1.10
 ```
 
+### French paraphrase augmentation
+
+To create new bilingual training samples, enable French pivot paraphrasing. The
+pipeline keeps the original low-resource-language sentence fixed, generates a
+new French paraphrase, and adds the new pair only to the training split. This
+expands both directions: `Ewe->French paraphrase` and `French paraphrase->Ewe`.
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --epochs 16 \
+    --max-augmented-variants 5 \
+    --enable-french-paraphrasing \
+    --paraphrase-model facebook/nllb-200-distilled-600M \
+    --paraphrase-pivot-language-code eng_Latn \
+    --paraphrase-num-return-sequences 1 \
+    --paraphrase-max-samples 3000
+```
+
+For a stronger but slower run, generate two paraphrases per French sentence:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --epochs 16 \
+    --max-augmented-variants 5 \
+    --enable-french-paraphrasing \
+    --paraphrase-num-return-sequences 2 \
+    --paraphrase-num-beams 8 \
+    --paraphrase-max-samples 3000
+```
+
+If the score drops, reduce `--paraphrase-max-samples` or go back to
+`--paraphrase-num-return-sequences 1`. The paraphraser filters empty, copied,
+length-mismatched, and near-identical generations.
+
 ### Back-translation with monolingual data
 
 To let the pipeline augment its own training split without an external file:

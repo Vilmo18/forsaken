@@ -6,6 +6,8 @@ import os
 import argparse
 import time
 import tqdm
+import gc
+from difflib import SequenceMatcher
 from unidecode import unidecode
 from num2words import num2words
 from datetime import datetime
@@ -239,6 +241,249 @@ class BilingualDataCleaner:
             return " ".join(text.lower().strip().split())
         return text
 
+    @staticmethod
+    def is_valid_french_paraphrase(
+        original,
+        paraphrase,
+        min_length_ratio=0.5,
+        max_length_ratio=1.8,
+        max_similarity=0.995,
+    ):
+        """Filter empty, copied, length-mismatched, and near-identical paraphrases."""
+        original_norm = BilingualDataCleaner.normalize_text(original)
+        paraphrase_norm = BilingualDataCleaner.normalize_text(paraphrase)
+        if not original_norm or not paraphrase_norm or original_norm == paraphrase_norm:
+            return False
+
+        original_length = max(1, len(original_norm.split()))
+        ratio = len(paraphrase_norm.split()) / original_length
+        if ratio < min_length_ratio or ratio > max_length_ratio:
+            return False
+
+        if max_similarity is not None and max_similarity < 1:
+            similarity = SequenceMatcher(None, original_norm, paraphrase_norm).ratio()
+            if similarity > max_similarity:
+                return False
+
+        return True
+
+    @staticmethod
+    def _strip_language_tags(text, language_codes):
+        text = " ".join(str(text).strip().split())
+        for code in language_codes:
+            prefix = f"{code} "
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        return text
+
+    def generate_french_pivot_paraphrases(
+        self,
+        data,
+        model_id="facebook/nllb-200-distilled-600M",
+        pivot_language_code="eng_Latn",
+        batch_size=16,
+        max_length=128,
+        num_beams=5,
+        num_return_sequences=1,
+        max_samples=None,
+        max_similarity=0.995,
+        do_sample=False,
+    ):
+        """
+        Generate French paraphrase pairs with a multilingual pivot model.
+
+        The trusted low-resource sentence is kept unchanged. Only the French
+        side is paraphrased, which creates valid extra pairs for both training
+        directions after the normal bidirectional split.
+        """
+        if num_return_sequences < 1:
+            raise ValueError("num_return_sequences must be positive")
+        if num_beams < num_return_sequences and not do_sample:
+            raise ValueError("num_beams must be >= num_return_sequences when sampling is disabled")
+
+        try:
+            import torch
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except Exception as exc:
+            raise ImportError(
+                "French paraphrasing requires torch and transformers to be installed"
+            ) from exc
+
+        work = data[[self.source_col, self.target_col]].dropna().copy()
+        work[self.source_col] = work[self.source_col].astype(str).str.strip()
+        work[self.target_col] = work[self.target_col].astype(str).str.strip()
+        work = work[work[self.source_col].ne('') & work[self.target_col].ne('')]
+        work = work.drop_duplicates(subset=[self.source_col, self.target_col]).reset_index(drop=True)
+        if max_samples is not None:
+            work = work.head(max_samples)
+
+        if work.empty:
+            return pd.DataFrame(columns=[self.source_col, self.target_col]), {
+                "model": model_id,
+                "pivot_language_code": pivot_language_code,
+                "input_examples": 0,
+                "generated_examples": 0,
+            }
+
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        if use_bf16:
+            dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        print(
+            f"\nGenerating French paraphrases with {model_id} "
+            f"via pivot {pivot_language_code}..."
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_id,
+            device_map="auto" if torch.cuda.is_available() else None,
+            torch_dtype=dtype,
+        )
+        model.eval()
+
+        french_code = "fra_Latn"
+        french_id = tokenizer.convert_tokens_to_ids(french_code)
+        pivot_id = tokenizer.convert_tokens_to_ids(pivot_language_code)
+        invalid_ids = {None, tokenizer.unk_token_id}
+        if french_id in invalid_ids:
+            raise ValueError(f"Model/tokenizer does not know French token: {french_code}")
+        if pivot_id in invalid_ids:
+            raise ValueError(f"Model/tokenizer does not know pivot token: {pivot_language_code}")
+
+        device = next(model.parameters()).device
+
+        def translate_batches(texts, src_lang, tgt_lang, forced_bos_id, returns_per_input=1):
+            translated = []
+            for start in tqdm.tqdm(
+                range(0, len(texts), batch_size),
+                desc=f"{src_lang}->{tgt_lang} paraphrase pass",
+            ):
+                batch = texts[start:start + batch_size]
+                tokenizer.src_lang = src_lang
+                tokenizer.tgt_lang = tgt_lang
+                inputs = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                ).to(device)
+                generation_kwargs = {
+                    "forced_bos_token_id": forced_bos_id,
+                    "max_new_tokens": max_length,
+                    "num_beams": max(num_beams, returns_per_input),
+                    "num_return_sequences": returns_per_input,
+                    "do_sample": do_sample,
+                    "early_stopping": True,
+                    "pad_token_id": tokenizer.pad_token_id,
+                    "eos_token_id": tokenizer.eos_token_id,
+                }
+                with torch.inference_mode():
+                    outputs = model.generate(**inputs, **generation_kwargs)
+                decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                decoded = [
+                    self._strip_language_tags(text, [src_lang, tgt_lang, french_code, pivot_language_code])
+                    for text in decoded
+                ]
+                if returns_per_input == 1:
+                    translated.extend(decoded)
+                else:
+                    for offset in range(0, len(decoded), returns_per_input):
+                        translated.append(decoded[offset:offset + returns_per_input])
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return translated
+
+        french_texts = work[self.target_col].tolist()
+        pivot_groups = translate_batches(
+            french_texts,
+            src_lang=french_code,
+            tgt_lang=pivot_language_code,
+            forced_bos_id=pivot_id,
+            returns_per_input=num_return_sequences,
+        )
+
+        flat_pivots = []
+        flat_source_indices = []
+        for row_index, candidates in enumerate(pivot_groups):
+            if isinstance(candidates, str):
+                candidates = [candidates]
+            seen_pivots = set()
+            for candidate in candidates:
+                normalized = self.normalize_text(candidate)
+                if normalized and normalized not in seen_pivots:
+                    seen_pivots.add(normalized)
+                    flat_pivots.append(candidate)
+                    flat_source_indices.append(row_index)
+
+        if not flat_pivots:
+            del model
+            del tokenizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return pd.DataFrame(columns=[self.source_col, self.target_col]), {
+                "model": model_id,
+                "pivot_language_code": pivot_language_code,
+                "input_examples": len(work),
+                "generated_examples": 0,
+            }
+
+        french_back = translate_batches(
+            flat_pivots,
+            src_lang=pivot_language_code,
+            tgt_lang=french_code,
+            forced_bos_id=french_id,
+            returns_per_input=1,
+        )
+
+        generated_rows = []
+        seen_pairs = set()
+        for row_index, paraphrase in zip(flat_source_indices, french_back):
+            original_row = work.iloc[row_index]
+            original_french = original_row[self.target_col]
+            paraphrase = self.normalize_typography(paraphrase)
+            if not self.is_valid_french_paraphrase(
+                original_french,
+                paraphrase,
+                max_similarity=max_similarity,
+            ):
+                continue
+            pair_key = (
+                self.normalize_text(original_row[self.source_col]),
+                self.normalize_text(paraphrase),
+            )
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            generated_rows.append({
+                self.source_col: original_row[self.source_col],
+                self.target_col: paraphrase,
+            })
+
+        del model
+        del tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        generated = pd.DataFrame(generated_rows, columns=[self.source_col, self.target_col])
+        stats = {
+            "model": model_id,
+            "pivot_language_code": pivot_language_code,
+            "input_examples": len(work),
+            "generated_examples": len(generated),
+            "num_return_sequences": num_return_sequences,
+            "max_similarity": max_similarity,
+        }
+        print(f"Generated {len(generated)} French paraphrase pairs")
+        return generated, stats
+
     def generate_paraphrases(self, data, batch_size=20, num_paraphrases=5, max_retries=3):
         """
         Generate paraphrases for French sentences using Azure OpenAI
@@ -385,6 +630,15 @@ class BilingualDataCleaner:
         max_augmented_variants=3,
         source_max_augmented_variants=None,
         target_max_augmented_variants=None,
+        enable_french_pivot_paraphrasing=False,
+        paraphrase_model="facebook/nllb-200-distilled-600M",
+        paraphrase_pivot_language_code="eng_Latn",
+        paraphrase_batch_size=16,
+        paraphrase_max_length=128,
+        paraphrase_num_beams=5,
+        paraphrase_num_return_sequences=1,
+        paraphrase_max_samples=None,
+        paraphrase_max_similarity=0.995,
     ):
         """
         Prepare train/validation datasets for both translation directions
@@ -424,6 +678,27 @@ class BilingualDataCleaner:
 
         # Optional paraphrases are generated only after the split so synthetic
         # versions of validation examples can never leak into training.
+        pivot_paraphrase_stats = None
+        if enable_french_pivot_paraphrasing:
+            paraphrased_train, pivot_paraphrase_stats = self.generate_french_pivot_paraphrases(
+                train_original,
+                model_id=paraphrase_model,
+                pivot_language_code=paraphrase_pivot_language_code,
+                batch_size=paraphrase_batch_size,
+                max_length=paraphrase_max_length,
+                num_beams=paraphrase_num_beams,
+                num_return_sequences=paraphrase_num_return_sequences,
+                max_samples=paraphrase_max_samples,
+                max_similarity=paraphrase_max_similarity,
+            )
+            if not paraphrased_train.empty:
+                train_original = (
+                    pd.concat([train_original, paraphrased_train], ignore_index=True)
+                    .drop_duplicates(subset=[self.source_col, self.target_col])
+                    .reset_index(drop=True)
+                )
+                print(f"Training pairs after French paraphrasing: {len(train_original)}")
+
         if enable_paraphrasing:
             print("\nGenerating training-only paraphrases...")
             train_original = self.generate_paraphrases(train_original)
@@ -496,7 +771,8 @@ class BilingualDataCleaner:
                 "augmentation_types": target_augmentation_counts,
                 "max_augmented_variants": target_max_augmented_variants,
                 "validation_examples": len(val_target_source),
-            }
+            },
+            "french_pivot_paraphrasing": pivot_paraphrase_stats,
         }
 
         return {
@@ -586,6 +862,15 @@ def main():
     parser.add_argument('--azure_endpoint', type=str, default=None, help='Azure OpenAI endpoint')
     parser.add_argument('--azure_deployment', type=str, default='gpt-4o', help='Azure OpenAI deployment name')
     parser.add_argument('--azure_api_key', type=str, default=None, help='Azure OpenAI API key')
+    parser.add_argument('--enable_french_pivot_paraphrasing', action='store_true', help='Enable local French pivot paraphrasing')
+    parser.add_argument('--paraphrase_model', type=str, default='facebook/nllb-200-distilled-600M', help='Multilingual seq2seq model for French pivot paraphrasing')
+    parser.add_argument('--paraphrase_pivot_language_code', type=str, default='eng_Latn', help='Pivot language code for paraphrasing')
+    parser.add_argument('--paraphrase_batch_size', type=int, default=16, help='Paraphrase generation batch size')
+    parser.add_argument('--paraphrase_max_length', type=int, default=128, help='Maximum paraphrase input/output length')
+    parser.add_argument('--paraphrase_num_beams', type=int, default=5, help='Beam size for paraphrase generation')
+    parser.add_argument('--paraphrase_num_return_sequences', type=int, default=1, help='Paraphrases generated per French sentence')
+    parser.add_argument('--paraphrase_max_samples', type=int, default=None, help='Limit number of training rows paraphrased')
+    parser.add_argument('--paraphrase_max_similarity', type=float, default=0.995, help='Reject near-copy paraphrases above this similarity')
 
     args = parser.parse_args()
 
@@ -624,6 +909,15 @@ def main():
         max_augmented_variants=args.max_augmented_variants,
         source_max_augmented_variants=args.source_max_augmented_variants,
         target_max_augmented_variants=args.target_max_augmented_variants,
+        enable_french_pivot_paraphrasing=args.enable_french_pivot_paraphrasing,
+        paraphrase_model=args.paraphrase_model,
+        paraphrase_pivot_language_code=args.paraphrase_pivot_language_code,
+        paraphrase_batch_size=args.paraphrase_batch_size,
+        paraphrase_max_length=args.paraphrase_max_length,
+        paraphrase_num_beams=args.paraphrase_num_beams,
+        paraphrase_num_return_sequences=args.paraphrase_num_return_sequences,
+        paraphrase_max_samples=args.paraphrase_max_samples,
+        paraphrase_max_similarity=args.paraphrase_max_similarity,
     )
     datasets = result['datasets']
 

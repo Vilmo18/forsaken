@@ -46,6 +46,15 @@ parser.add_argument("--early-stopping-patience", type=int, default=None)
 parser.add_argument("--max-augmented-variants", type=int, default=None)
 parser.add_argument("--source-max-augmented-variants", type=int, default=None)
 parser.add_argument("--french-max-augmented-variants", type=int, default=None)
+parser.add_argument("--enable-french-paraphrasing", action="store_true")
+parser.add_argument("--paraphrase-model", default="facebook/nllb-200-distilled-600M")
+parser.add_argument("--paraphrase-pivot-language-code", default="eng_Latn")
+parser.add_argument("--paraphrase-batch-size", type=int, default=16)
+parser.add_argument("--paraphrase-max-length", type=int, default=None)
+parser.add_argument("--paraphrase-num-beams", type=int, default=5)
+parser.add_argument("--paraphrase-num-return-sequences", type=int, default=1)
+parser.add_argument("--paraphrase-max-samples", type=int, default=None)
+parser.add_argument("--paraphrase-max-similarity", type=float, default=0.995)
 parser.add_argument("--language-to-french-weight", type=float, default=1.0)
 parser.add_argument("--french-to-language-weight", type=float, default=1.0)
 parser.add_argument("--monolingual-data", default=None)
@@ -105,6 +114,7 @@ early_stopping_patience = (
 eval_num_beams = args.eval_num_beams or (5 if args.fast else 4)
 eval_max_new_tokens = args.eval_max_new_tokens or max_length
 eval_batch_size = args.eval_batch_size or (32 if args.fast else 25)
+paraphrase_max_length = args.paraphrase_max_length or max_length
 
 if min(batch_size, gradient_accumulation_steps, num_train_epochs, max_length) < 1:
     parser.error("batch size, accumulation steps, epochs, and max length must be positive")
@@ -128,6 +138,16 @@ if early_stopping_patience is not None and early_stopping_patience < 1:
     parser.error("early stopping patience must be positive")
 if args.eval_no_repeat_ngram_size < 0:
     parser.error("eval no-repeat ngram size must be non-negative")
+if args.paraphrase_batch_size < 1:
+    parser.error("paraphrase batch size must be positive")
+if min(paraphrase_max_length, args.paraphrase_num_beams, args.paraphrase_num_return_sequences) < 1:
+    parser.error("paraphrase length, beams, and return sequences must be positive")
+if args.paraphrase_num_beams < args.paraphrase_num_return_sequences:
+    parser.error("paraphrase num beams must be >= num return sequences")
+if args.paraphrase_max_samples is not None and args.paraphrase_max_samples < 1:
+    parser.error("paraphrase max samples must be positive")
+if not 0 < args.paraphrase_max_similarity <= 1:
+    parser.error("paraphrase max similarity must be in (0, 1]")
 
 dataset_files = Path(DATASET_DIR).glob("*.xlsx")
 
@@ -228,6 +248,15 @@ for file_path in dataset_files:
         max_augmented_variants=max_augmented_variants,
         source_max_augmented_variants=source_max_augmented_variants,
         target_max_augmented_variants=french_max_augmented_variants,
+        enable_french_pivot_paraphrasing=args.enable_french_paraphrasing,
+        paraphrase_model=args.paraphrase_model,
+        paraphrase_pivot_language_code=args.paraphrase_pivot_language_code,
+        paraphrase_batch_size=args.paraphrase_batch_size,
+        paraphrase_max_length=paraphrase_max_length,
+        paraphrase_num_beams=args.paraphrase_num_beams,
+        paraphrase_num_return_sequences=args.paraphrase_num_return_sequences,
+        paraphrase_max_samples=args.paraphrase_max_samples,
+        paraphrase_max_similarity=args.paraphrase_max_similarity,
     )
 
     datasets = cleaning_result["datasets"]
@@ -252,6 +281,15 @@ for file_path in dataset_files:
     "max_augmented_variants": max_augmented_variants,
     "source_max_augmented_variants": source_max_augmented_variants,
     "french_max_augmented_variants": french_max_augmented_variants,
+    "enable_french_paraphrasing": args.enable_french_paraphrasing,
+    "paraphrase_model": args.paraphrase_model,
+    "paraphrase_pivot_language_code": args.paraphrase_pivot_language_code,
+    "paraphrase_batch_size": args.paraphrase_batch_size,
+    "paraphrase_max_length": paraphrase_max_length,
+    "paraphrase_num_beams": args.paraphrase_num_beams,
+    "paraphrase_num_return_sequences": args.paraphrase_num_return_sequences,
+    "paraphrase_max_samples": args.paraphrase_max_samples,
+    "paraphrase_max_similarity": args.paraphrase_max_similarity,
     "balance_directions": True,
     "language_to_french_weight": args.language_to_french_weight,
     "french_to_language_weight": args.french_to_language_weight,
