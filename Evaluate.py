@@ -15,6 +15,11 @@ class BilingualEvaluator:
         model_path,
         model_type="merged",
         base_model_id=DEFAULT_MODEL_ID,
+        max_input_length=256,
+        max_new_tokens=128,
+        num_beams=4,
+        no_repeat_ngram_size=3,
+        eval_batch_size=32,
     ):
         """
         Initialize evaluator for a specific language
@@ -30,108 +35,130 @@ class BilingualEvaluator:
         self.model_path = model_path
         self.model_type = model_type
         self.base_model_id = base_model_id
+        self.max_input_length = max_input_length
+        self.max_new_tokens = max_new_tokens
+        self.num_beams = num_beams
+        self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.eval_batch_size = eval_batch_size
         self.model = None
         self.tokenizer = None
-        
+
     def load_model(self):
         """Load the trained model and tokenizer"""
         print(f"Loading {self.model_type} model from {self.model_path}")
-        
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        if use_bf16:
+            dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
         if self.model_type == "lora":
             base_model = AutoModelForSeq2SeqLM.from_pretrained(
                 self.base_model_id,
                 device_map="auto",
-                torch_dtype=torch.float16
+                torch_dtype=dtype
             )
             self.model = PeftModel.from_pretrained(base_model, self.model_path)
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         else:
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.model_path, 
+                self.model_path,
                 device_map="auto",
-                torch_dtype=torch.float16
+                torch_dtype=dtype
             )
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            
+        self.model.eval()
+
         print(f"Model loaded successfully")
-        
+
+    def _model_device(self):
+        return next(self.model.parameters()).device
+
+    def _clean_translation(self, translation):
+        """Remove language tags sometimes emitted by NLLB."""
+        translation = translation.strip()
+        for tag in (self.language_code, "fra_Latn"):
+            prefix = f"{tag} "
+            if translation.startswith(prefix):
+                translation = translation[len(prefix):].strip()
+        return translation
+
+    def _translate_batch(self, texts, src_lang, tgt_lang):
+        """Translate a batch while preserving empty-string positions."""
+        if not texts:
+            return []
+
+        results = [""] * len(texts)
+        clean_inputs = []
+        clean_positions = []
+        for index, text in enumerate(texts):
+            text = "" if pd.isna(text) else str(text).strip()
+            if text:
+                clean_positions.append(index)
+                clean_inputs.append(text)
+
+        if not clean_inputs:
+            return results
+
+        self.tokenizer.src_lang = src_lang
+        self.tokenizer.tgt_lang = tgt_lang
+        inputs = self.tokenizer(
+            clean_inputs,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_input_length,
+        ).to(self._model_device())
+
+        generation_kwargs = {
+            "forced_bos_token_id": self.tokenizer.convert_tokens_to_ids(tgt_lang),
+            "max_new_tokens": self.max_new_tokens,
+            "num_beams": self.num_beams,
+            "early_stopping": True,
+            "do_sample": False,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if self.no_repeat_ngram_size and self.no_repeat_ngram_size > 0:
+            generation_kwargs["no_repeat_ngram_size"] = self.no_repeat_ngram_size
+
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **generation_kwargs)
+
+        translations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        for index, translation in zip(clean_positions, translations):
+            results[index] = self._clean_translation(translation)
+        return results
+
+    def translate_lang_to_french_batch(self, lang_texts):
+        """Translate a batch from the local language to French."""
+        return self._translate_batch(lang_texts, self.language_code, "fra_Latn")
+
+    def translate_french_to_lang_batch(self, french_texts):
+        """Translate a batch from French to the local language."""
+        return self._translate_batch(french_texts, "fra_Latn", self.language_code)
+
     def translate_lang_to_french(self, lang_text):
         """Translate language text to French"""
-        if not lang_text or not lang_text.strip():
-            return ""
-        
         try:
-            self.tokenizer.src_lang = self.language_code
-            self.tokenizer.tgt_lang = "fra_Latn"
-            
-            inputs = self.tokenizer(lang_text, return_tensors="pt", truncation=True, max_length=256).to(self.model.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    forced_bos_token_id=self.tokenizer.convert_tokens_to_ids("fra_Latn"),
-                    max_new_tokens=96,
-                    num_beams=4,
-                    no_repeat_ngram_size=3,
-                    early_stopping=True,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
-            
-            translation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Clean up language tags
-            if translation.startswith("fra_Latn "):
-                translation = translation[9:]
-            if translation.startswith(f"{self.language_code} "):
-                translation = translation[len(self.language_code) + 1:]
-                
-            return translation.strip()
-            
+            return self.translate_lang_to_french_batch([lang_text])[0]
+
         except Exception as e:
-            print(f"Translation error for '{lang_text[:50]}...': {e}")
+            print(f"Translation error for '{str(lang_text)[:50]}...': {e}")
             return ""
     
     def translate_french_to_lang(self, french_text):
         """Translate French text to language"""
-        if not french_text or not french_text.strip():
-            return ""
-        
         try:
-            self.tokenizer.src_lang = "fra_Latn"
-            self.tokenizer.tgt_lang = self.language_code
-            
-            inputs = self.tokenizer(french_text, return_tensors="pt", truncation=True, max_length=256).to(self.model.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(self.language_code),
-                    max_new_tokens=96,
-                    num_beams=4,
-                    no_repeat_ngram_size=3,
-                    early_stopping=True,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
-            
-            translation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Clean up language tags
-            if translation.startswith(f"{self.language_code} "):
-                translation = translation[len(self.language_code) + 1:]
-            if translation.startswith("fra_Latn "):
-                translation = translation[9:]
-                
-            return translation.strip()
-            
+            return self.translate_french_to_lang_batch([french_text])[0]
+
         except Exception as e:
-            print(f"Translation error for '{french_text[:50]}...': {e}")
+            print(f"Translation error for '{str(french_text)[:50]}...': {e}")
             return ""
-    
-    def evaluate_direction(self, val_df, direction, translate_fn, source_col, target_col):
+
+    def evaluate_direction(self, val_df, direction, translate_fn, source_col, target_col, batch_translate_fn=None):
         """Evaluate translation quality for one direction"""
         print(f"\n{'='*60}")
         print(f"EVALUATING {direction.upper()}")
@@ -151,15 +178,17 @@ class BilingualEvaluator:
         print(f"Translating {len(source_texts)} samples...")
         
         generated_translations = []
-        batch_size = 25
-        
+        batch_size = self.eval_batch_size
+
         for i in tqdm(range(0, len(source_texts), batch_size), desc=f"{direction} translation"):
             batch_sources = source_texts[i:i+batch_size]
-            batch_translations = []
-            
-            for source_text in batch_sources:
-                translation = translate_fn(source_text)
-                batch_translations.append(translation)
+            if batch_translate_fn is not None:
+                batch_translations = batch_translate_fn(batch_sources)
+            else:
+                batch_translations = []
+                for source_text in batch_sources:
+                    translation = translate_fn(source_text)
+                    batch_translations.append(translation)
             
             generated_translations.extend(batch_translations)
             
@@ -209,6 +238,10 @@ def main():
     parser.add_argument("--base_model_id", default=DEFAULT_MODEL_ID, help="Base model used by a LoRA adapter")
     parser.add_argument("--val_lang2fr", required=True, help="Path to validation Lang->French JSONL")
     parser.add_argument("--val_fr2lang", required=True, help="Path to validation French->Lang JSONL")
+    parser.add_argument("--eval_num_beams", type=int, default=4, help="Beam size used during generation")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=128, help="Maximum generated tokens")
+    parser.add_argument("--eval_batch_size", type=int, default=32, help="Evaluation generation batch size")
+    parser.add_argument("--eval_no_repeat_ngram_size", type=int, default=3, help="No-repeat ngram size; use 0 to disable")
     
     args = parser.parse_args()
     
@@ -218,6 +251,10 @@ def main():
         args.model_path,
         args.model_type,
         args.base_model_id,
+        max_new_tokens=args.eval_max_new_tokens,
+        num_beams=args.eval_num_beams,
+        no_repeat_ngram_size=args.eval_no_repeat_ngram_size,
+        eval_batch_size=args.eval_batch_size,
     )
     
     evaluator.load_model()
@@ -235,18 +272,20 @@ def main():
     # Evaluate both directions
     lang2fr_results, lang2fr_preds, lang2fr_src, lang2fr_refs = evaluator.evaluate_direction(
         val_lang2fr, 
-        f"{args.language}-to-French", 
-        evaluator.translate_lang_to_french, 
-        args.language, 
-        "French"
+        f"{args.language}-to-French",
+        evaluator.translate_lang_to_french,
+        args.language,
+        "French",
+        batch_translate_fn=evaluator.translate_lang_to_french_batch,
     )
     
     fr2lang_results, fr2lang_preds, fr2lang_src, fr2lang_refs = evaluator.evaluate_direction(
         val_fr2lang, 
-        f"French-to-{args.language}", 
-        evaluator.translate_french_to_lang, 
-        "French", 
-        args.language
+        f"French-to-{args.language}",
+        evaluator.translate_french_to_lang,
+        "French",
+        args.language,
+        batch_translate_fn=evaluator.translate_french_to_lang_batch,
     )
     
     print(f"\n{'='*60}")

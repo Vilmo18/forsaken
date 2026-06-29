@@ -6,7 +6,8 @@ A repository which contains the complete pipeline from data pre-processing to ev
 - Cleans and preprocesses text data
 - Handles numbers, dates, and special characters in French
 - Creates bounded training-only augmentations through transliteration,
-  diacritic removal, typography normalization, and punctuation variants
+  diacritic removal, typography normalization, punctuation variants, and
+  optional casing/quote cleanup variants
 - Prepares train/validation splits for both translation directions
 - Outputs Hugging Face Dataset compatible JSONL files
 
@@ -57,9 +58,10 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast
 
 Replace `ewe` with `mina` or `kabye`. The pipeline uses the NLLB distilled 600M
 model. Fast mode defaults to a batch size of 16, 8 epochs, BF16 when supported
-(otherwise FP16), a 128-token limit, and keeps the checkpoint with the best
-validation loss. Augmentation is applied only to the training split, and the
-two translation directions are balanced to contribute equally.
+(otherwise FP16), a 128-token limit, 5 augmentation variants, cosine learning
+rate decay, early stopping, beam-5 evaluation, and keeps the checkpoint with
+the best validation loss. Augmentation is applied only to the training split,
+and the two translation directions are balanced by default.
 
 The main training settings can be overridden from the command line:
 
@@ -70,7 +72,33 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast \
     --gradient-accumulation-steps 1 \
     --epochs 8 \
     --max-length 128 \
-    --max-augmented-variants 3
+    --max-augmented-variants 5 \
+    --learning-rate 1e-4 \
+    --warmup-ratio 0.05 \
+    --eval-num-beams 5
+```
+
+For score hunting on Ewe, start from the best augmentation run and give a
+small extra weight to the harder French->Ewe direction:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --epochs 16 \
+    --max-augmented-variants 5 \
+    --french-to-language-weight 1.10 \
+    --eval-num-beams 5 \
+    --eval-max-new-tokens 128
+```
+
+If the French->Ewe score improves but Ewe->French drops too much, reduce the
+weight back toward `1.0`. To test more input robustness on French sources only:
+
+```bash
+python3 lrl_fr-pipeline.py --dataset ewe --fast \
+    --epochs 16 \
+    --source-max-augmented-variants 5 \
+    --french-max-augmented-variants 8 \
+    --french-to-language-weight 1.10
 ```
 
 ### Back-translation with monolingual data
@@ -100,8 +128,9 @@ python3 lrl_fr-pipeline.py --dataset ewe --fast \
 The back-translation model generates synthetic French sources while the
 original Ewe sentences remain the trusted targets. Empty, copied,
 length-mismatched, cycle-inconsistent, and duplicate pairs are filtered before
-fine-tuning. If `--backtranslation-model` is omitted, the configured base model
-is used. Set the cycle-similarity threshold to `0` to disable round-trip
+fine-tuning. If `--backtranslation-model` is omitted, the most recent completed
+model for the language is used when available; otherwise the configured base
+model is used. Set the cycle-similarity threshold to `0` to disable round-trip
 filtering.
 
 ## Model Evaluation

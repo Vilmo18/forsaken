@@ -35,7 +35,19 @@ parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
 parser.add_argument("--epochs", type=int, default=None)
 parser.add_argument("--max-length", type=int, default=None)
 parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-parser.add_argument("--max-augmented-variants", type=int, default=3)
+parser.add_argument("--learning-rate", type=float, default=None)
+parser.add_argument("--weight-decay", type=float, default=None)
+parser.add_argument("--warmup-ratio", type=float, default=None)
+parser.add_argument("--lr-scheduler-type", default=None)
+parser.add_argument("--lora-r", type=int, default=None)
+parser.add_argument("--lora-alpha", type=int, default=None)
+parser.add_argument("--lora-dropout", type=float, default=None)
+parser.add_argument("--early-stopping-patience", type=int, default=None)
+parser.add_argument("--max-augmented-variants", type=int, default=None)
+parser.add_argument("--source-max-augmented-variants", type=int, default=None)
+parser.add_argument("--french-max-augmented-variants", type=int, default=None)
+parser.add_argument("--language-to-french-weight", type=float, default=1.0)
+parser.add_argument("--french-to-language-weight", type=float, default=1.0)
 parser.add_argument("--monolingual-data", default=None)
 parser.add_argument("--monolingual-column", default=None)
 parser.add_argument(
@@ -47,6 +59,10 @@ parser.add_argument("--backtranslation-model", default=None)
 parser.add_argument("--backtranslation-batch-size", type=int, default=16)
 parser.add_argument("--backtranslation-min-cycle-similarity", type=float, default=0.45)
 parser.add_argument("--max-synthetic-samples", type=int, default=None)
+parser.add_argument("--eval-num-beams", type=int, default=None)
+parser.add_argument("--eval-max-new-tokens", type=int, default=None)
+parser.add_argument("--eval-batch-size", type=int, default=None)
+parser.add_argument("--eval-no-repeat-ngram-size", type=int, default=3)
 args = parser.parse_args()
 
 batch_size = args.batch_size or (16 if args.fast else 2)
@@ -59,10 +75,40 @@ if gradient_accumulation_steps is None:
     )
 num_train_epochs = args.epochs or 8
 max_length = args.max_length or (128 if args.fast else 256)
+max_augmented_variants = (
+    args.max_augmented_variants
+    if args.max_augmented_variants is not None
+    else (5 if args.fast else 3)
+)
+source_max_augmented_variants = (
+    args.source_max_augmented_variants
+    if args.source_max_augmented_variants is not None
+    else max_augmented_variants
+)
+french_max_augmented_variants = (
+    args.french_max_augmented_variants
+    if args.french_max_augmented_variants is not None
+    else max_augmented_variants
+)
+lora_r = args.lora_r or 32
+lora_alpha = args.lora_alpha or lora_r * 2
+lora_dropout = 0.1 if args.lora_dropout is None else args.lora_dropout
+learning_rate = args.learning_rate or (1e-4 if args.fast else 3e-5)
+weight_decay = args.weight_decay if args.weight_decay is not None else (0.01 if args.fast else 0.0)
+warmup_ratio = args.warmup_ratio if args.warmup_ratio is not None else (0.05 if args.fast else 0.0)
+lr_scheduler_type = args.lr_scheduler_type or ("cosine" if args.fast else "linear")
+early_stopping_patience = (
+    args.early_stopping_patience
+    if args.early_stopping_patience is not None
+    else (3 if args.fast else None)
+)
+eval_num_beams = args.eval_num_beams or (5 if args.fast else 4)
+eval_max_new_tokens = args.eval_max_new_tokens or max_length
+eval_batch_size = args.eval_batch_size or (32 if args.fast else 25)
 
 if min(batch_size, gradient_accumulation_steps, num_train_epochs, max_length) < 1:
     parser.error("batch size, accumulation steps, epochs, and max length must be positive")
-if args.max_augmented_variants < 0:
+if min(max_augmented_variants, source_max_augmented_variants, french_max_augmented_variants) < 0:
     parser.error("max augmented variants must be non-negative")
 if args.backtranslation_batch_size < 1:
     parser.error("backtranslation batch size must be positive")
@@ -70,6 +116,18 @@ if args.max_synthetic_samples is not None and args.max_synthetic_samples < 1:
     parser.error("max synthetic samples must be positive")
 if not 0 <= args.backtranslation_min_cycle_similarity <= 1:
     parser.error("backtranslation cycle similarity must be between 0 and 1")
+if args.language_to_french_weight <= 0 or args.french_to_language_weight <= 0:
+    parser.error("direction weights must be positive")
+if min(lora_r, lora_alpha, eval_num_beams, eval_max_new_tokens, eval_batch_size) < 1:
+    parser.error("LoRA rank/alpha and evaluation generation settings must be positive")
+if not 0 <= lora_dropout < 1:
+    parser.error("LoRA dropout must be in [0, 1)")
+if learning_rate <= 0 or weight_decay < 0 or warmup_ratio < 0:
+    parser.error("learning rate must be positive; weight decay and warmup ratio must be non-negative")
+if early_stopping_patience is not None and early_stopping_patience < 1:
+    parser.error("early stopping patience must be positive")
+if args.eval_no_repeat_ngram_size < 0:
+    parser.error("eval no-repeat ngram size must be non-negative")
 
 dataset_files = Path(DATASET_DIR).glob("*.xlsx")
 
@@ -167,7 +225,9 @@ for file_path in dataset_files:
         test_size=0.2,
         seed=42,
         enable_paraphrasing=False,
-        max_augmented_variants=args.max_augmented_variants,
+        max_augmented_variants=max_augmented_variants,
+        source_max_augmented_variants=source_max_augmented_variants,
+        target_max_augmented_variants=french_max_augmented_variants,
     )
 
     datasets = cleaning_result["datasets"]
@@ -189,8 +249,24 @@ for file_path in dataset_files:
     "effective_batch_size": batch_size * gradient_accumulation_steps,
     "num_train_epochs": num_train_epochs,
     "max_length": max_length,
-    "max_augmented_variants": args.max_augmented_variants,
+    "max_augmented_variants": max_augmented_variants,
+    "source_max_augmented_variants": source_max_augmented_variants,
+    "french_max_augmented_variants": french_max_augmented_variants,
     "balance_directions": True,
+    "language_to_french_weight": args.language_to_french_weight,
+    "french_to_language_weight": args.french_to_language_weight,
+    "learning_rate": learning_rate,
+    "weight_decay": weight_decay,
+    "warmup_ratio": warmup_ratio,
+    "lr_scheduler_type": lr_scheduler_type,
+    "lora_r": lora_r,
+    "lora_alpha": lora_alpha,
+    "lora_dropout": lora_dropout,
+    "early_stopping_patience": early_stopping_patience,
+    "eval_num_beams": eval_num_beams,
+    "eval_max_new_tokens": eval_max_new_tokens,
+    "eval_batch_size": eval_batch_size,
+    "eval_no_repeat_ngram_size": args.eval_no_repeat_ngram_size,
     "monolingual_data": args.monolingual_data,
     "self_backtranslation": args.self_backtranslation,
     "backtranslation_model": args.backtranslation_model,
@@ -315,7 +391,11 @@ for file_path in dataset_files:
 
     finetuner.setup_model_and_tokenizer()
 
-    finetuner.setup_lora()
+    finetuner.setup_lora(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    )
 
     train_ds, eval_ds = finetuner.tokenize_data(
         train_t2f,
@@ -323,6 +403,8 @@ for file_path in dataset_files:
         train_f2t,
         val_f2t,
         max_length=max_length,
+        language_to_french_weight=args.language_to_french_weight,
+        french_to_language_weight=args.french_to_language_weight,
     )
 
     model_output = tracker.model_dir
@@ -332,13 +414,20 @@ for file_path in dataset_files:
         "per_device_train_batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "num_train_epochs": num_train_epochs,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler_type": lr_scheduler_type,
     }
+    if early_stopping_patience is not None:
+        training_args["early_stopping_patience"] = early_stopping_patience
+        training_args["load_best_model_at_end"] = True
+        training_args["metric_for_best_model"] = "eval_loss"
+        training_args["greater_is_better"] = False
 
     if args.fast:
         training_args.update({
             "per_device_eval_batch_size": batch_size * 2,
-            "learning_rate": 1e-4,
-            "weight_decay": 0.01,
             "save_strategy": "epoch",
             "eval_strategy": "epoch",
             "load_best_model_at_end": True,
@@ -347,7 +436,6 @@ for file_path in dataset_files:
             "save_total_limit": 2,
             "logging_steps": 50,
             "warmup_steps": 0,
-            "warmup_ratio": 0.05,
             "group_by_length": True,
             "dataloader_num_workers": 4,
         })
@@ -373,6 +461,11 @@ for file_path in dataset_files:
         model_path=merged_model_path,
         model_type="merged",
         base_model_id=args.model_id,
+        max_input_length=max_length,
+        max_new_tokens=eval_max_new_tokens,
+        num_beams=eval_num_beams,
+        no_repeat_ngram_size=args.eval_no_repeat_ngram_size,
+        eval_batch_size=eval_batch_size,
     )
 
     evaluator.load_model()
@@ -391,6 +484,7 @@ for file_path in dataset_files:
         val_df=val_lang2fr,
         direction=f"{language}-to-French",
         translate_fn=evaluator.translate_lang_to_french,
+        batch_translate_fn=evaluator.translate_lang_to_french_batch,
         source_col=language,
         target_col="French"
     )
@@ -399,6 +493,7 @@ for file_path in dataset_files:
         val_df=val_fr2lang,
         direction=f"French-to-{language}",
         translate_fn=evaluator.translate_french_to_lang,
+        batch_translate_fn=evaluator.translate_french_to_lang_batch,
         source_col="French",
         target_col=language
     )

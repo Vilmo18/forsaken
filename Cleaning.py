@@ -175,7 +175,49 @@ class BilingualDataCleaner:
         })
         text = text.translate(translations)
         text = re.sub(r'\s+([,.;:!?])', r'\1', text)
+        text = re.sub(r"\s+'\s*", "'", text)
         return " ".join(text.split())
+
+    @staticmethod
+    def normalize_unicode(text: str) -> str:
+        """Normalize Unicode composition and repeated whitespace."""
+        if not isinstance(text, str):
+            return text
+        return unicodedata.normalize('NFC', " ".join(text.split()))
+
+    @staticmethod
+    def strip_outer_quotes(text: str) -> str:
+        """Remove wrapping quotes that often appear after spreadsheet export."""
+        if not isinstance(text, str):
+            return text
+        text = text.strip()
+        quote_pairs = [
+            ('"', '"'),
+            ("'", "'"),
+            ('“', '”'),
+            ('«', '»'),
+        ]
+        for left, right in quote_pairs:
+            if len(text) >= 2 and text.startswith(left) and text.endswith(right):
+                return text[1:-1].strip()
+        return text
+
+    @staticmethod
+    def lowercase_first_letter(text: str) -> str:
+        """Add a light casing variant without fully changing the sentence."""
+        if not isinstance(text, str) or not text:
+            return text
+        for index, char in enumerate(text):
+            if char.isalpha():
+                return text[:index] + char.lower() + text[index + 1:]
+        return text
+
+    @staticmethod
+    def lowercase_text(text: str) -> str:
+        """Create a lowercase input-only robustness variant."""
+        if not isinstance(text, str):
+            return text
+        return text.lower()
 
     @staticmethod
     def strip_terminal_punctuation(text: str) -> str:
@@ -310,6 +352,10 @@ class BilingualDataCleaner:
             ('normalized_typography', self.normalize_typography),
             ('no_terminal_punctuation', self.strip_terminal_punctuation),
             ('normalized_noisy_input', self.normalize_noisy_input),
+            ('unicode_normalized', self.normalize_unicode),
+            ('outer_quotes_removed', self.strip_outer_quotes),
+            ('lowercase_first_letter', self.lowercase_first_letter),
+            ('lowercase_text', self.lowercase_text),
         ]
 
         for name, transform in transformations:
@@ -337,10 +383,19 @@ class BilingualDataCleaner:
         seed=42,
         enable_paraphrasing=False,
         max_augmented_variants=3,
+        source_max_augmented_variants=None,
+        target_max_augmented_variants=None,
     ):
         """
         Prepare train/validation datasets for both translation directions
         """
+        if source_max_augmented_variants is None:
+            source_max_augmented_variants = max_augmented_variants
+        if target_max_augmented_variants is None:
+            target_max_augmented_variants = max_augmented_variants
+        if source_max_augmented_variants < 0 or target_max_augmented_variants < 0:
+            raise ValueError("augmentation variant limits must be non-negative")
+
         for col in [self.source_col, self.target_col]:
             data[col] = (
                 data[col]
@@ -378,7 +433,7 @@ class BilingualDataCleaner:
         train_source_target_augmented = self.create_augmentations(
             train_original,
             input_column=self.source_col,
-            max_augmented_variants=max_augmented_variants,
+            max_augmented_variants=source_max_augmented_variants,
         )
         source_augmentation_counts = {
             str(name): int(count)
@@ -390,7 +445,7 @@ class BilingualDataCleaner:
         train_target_source_augmented = self.create_augmentations(
             train_target_source_original,
             input_column=self.target_col,
-            max_augmented_variants=max_augmented_variants,
+            max_augmented_variants=target_max_augmented_variants,
         )
         target_augmentation_counts = {
             str(name): int(count)
@@ -430,6 +485,7 @@ class BilingualDataCleaner:
                 "augmented_examples": augmented_source_target_size,
                 "augmentation_gain": augmented_source_target_size - len(train_original),
                 "augmentation_types": source_augmentation_counts,
+                "max_augmented_variants": source_max_augmented_variants,
                 "validation_examples": len(val_source_target),
             },
             "target_to_source": {
@@ -438,6 +494,7 @@ class BilingualDataCleaner:
                 "augmented_examples": augmented_target_source_size,
                 "augmentation_gain": augmented_target_source_size - len(train_target_source_original),
                 "augmentation_types": target_augmentation_counts,
+                "max_augmented_variants": target_max_augmented_variants,
                 "validation_examples": len(val_target_source),
             }
         }
@@ -511,6 +568,18 @@ def main():
         default=3,
         help='Maximum synthetic input variants per original training pair',
     )
+    parser.add_argument(
+        '--source_max_augmented_variants',
+        type=int,
+        default=None,
+        help='Maximum input variants for language->French training pairs',
+    )
+    parser.add_argument(
+        '--target_max_augmented_variants',
+        type=int,
+        default=None,
+        help='Maximum input variants for French->language training pairs',
+    )
 
     # Paraphrasing arguments
     parser.add_argument('--enable_paraphrasing', action='store_true', help='Enable paraphrasing augmentation')
@@ -553,6 +622,8 @@ def main():
         seed=args.seed,
         enable_paraphrasing=args.enable_paraphrasing,
         max_augmented_variants=args.max_augmented_variants,
+        source_max_augmented_variants=args.source_max_augmented_variants,
+        target_max_augmented_variants=args.target_max_augmented_variants,
     )
     datasets = result['datasets']
 

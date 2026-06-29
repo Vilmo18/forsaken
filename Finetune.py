@@ -4,9 +4,11 @@ import torch
 import random
 import wandb
 import os
+import math
 from datasets import Dataset, concatenate_datasets
 from transformers import (AutoTokenizer, AutoModelForSeq2SeqLM,
-                          DataCollatorForSeq2Seq, TrainingArguments, Trainer)
+                          DataCollatorForSeq2Seq, TrainingArguments, Trainer,
+                          EarlyStoppingCallback)
 from peft import LoraConfig, get_peft_model, TaskType
 from pathlib import Path
 import argparse
@@ -143,9 +145,13 @@ class BilingualFineTuner:
         val_f2t,
         max_length=256,
         balance_directions=True,
+        language_to_french_weight=1.0,
+        french_to_language_weight=1.0,
     ):
         """Tokenize the datasets for both translation directions"""
-        
+        if language_to_french_weight <= 0 or french_to_language_weight <= 0:
+            raise ValueError("direction weights must be positive")
+
         def map_lang_to_french(batch):
             """Tokenize Language->French pairs"""
             self.tokenizer.src_lang = self.language_code
@@ -177,9 +183,20 @@ class BilingualFineTuner:
         tok_val_f2t   = val_f2t.map(map_french_to_lang, batched=True, remove_columns=val_f2t.column_names)
 
         if balance_directions:
-            target_size = max(len(tok_train_t2f), len(tok_train_f2t))
+            unit_size = max(
+                len(tok_train_t2f) / language_to_french_weight,
+                len(tok_train_f2t) / french_to_language_weight,
+            )
+            target_t2f_size = max(
+                len(tok_train_t2f),
+                math.ceil(unit_size * language_to_french_weight),
+            )
+            target_f2t_size = max(
+                len(tok_train_f2t),
+                math.ceil(unit_size * french_to_language_weight),
+            )
 
-            def upsample(dataset, seed):
+            def upsample(dataset, target_size, seed):
                 if len(dataset) == 0:
                     raise ValueError("Cannot balance an empty translation dataset")
                 if len(dataset) == target_size:
@@ -195,12 +212,14 @@ class BilingualFineTuner:
 
             before_t2f = len(tok_train_t2f)
             before_f2t = len(tok_train_f2t)
-            tok_train_t2f = upsample(tok_train_t2f, seed=42)
-            tok_train_f2t = upsample(tok_train_f2t, seed=43)
+            tok_train_t2f = upsample(tok_train_t2f, target_t2f_size, seed=42)
+            tok_train_f2t = upsample(tok_train_f2t, target_f2t_size, seed=43)
             print(
                 "Balanced training directions: "
-                f"T2F {before_t2f}->{len(tok_train_t2f)}, "
-                f"F2T {before_f2t}->{len(tok_train_f2t)}"
+                f"T2F {before_t2f}->{len(tok_train_t2f)} "
+                f"(weight={language_to_french_weight}), "
+                f"F2T {before_f2t}->{len(tok_train_f2t)} "
+                f"(weight={french_to_language_weight})"
             )
 
         train_ds = concatenate_datasets([tok_train_t2f, tok_train_f2t]).shuffle(seed=42)
@@ -212,7 +231,8 @@ class BilingualFineTuner:
     
     def train(self, train_dataset, eval_dataset, output_dir, **training_args):
         """Run the training process"""
-        
+        early_stopping_patience = training_args.pop("early_stopping_patience", None)
+
         collator = DataCollatorForSeq2Seq(
             self.tokenizer,
             model=self.model,
@@ -242,6 +262,13 @@ class BilingualFineTuner:
         default_args.update(training_args)
         
         args = TrainingArguments(**default_args)
+        callbacks = []
+        if early_stopping_patience is not None and early_stopping_patience > 0:
+            callbacks.append(
+                EarlyStoppingCallback(
+                    early_stopping_patience=early_stopping_patience,
+                )
+            )
 
         trainer = Trainer(
             model=self.model,
@@ -249,6 +276,7 @@ class BilingualFineTuner:
             data_collator=collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            callbacks=callbacks,
         )
 
         print(f"Starting {self.language_name}-French bidirectional training...")
